@@ -26,30 +26,168 @@ api_key = st.text_input("Introdu cheia ", type="password")
 # =========================
 # HELPERS
 # =========================
+
+# Instruction paragraph detection
+INSTRUCTION_STARTERS = (
+    "Bitte ", "Mehrfachantworten", "Mehrfach ",
+)
+
+
+def is_instruction_paragraph(para) -> bool:
+    """
+    Returns True if this paragraph is a survey instruction:
+    - starts with 'Bitte ' or 'Mehrfachantworten'
+    - AND is NOT fully bold (all-bold = question text, not instruction)
+    """
+    text = para.text.strip()
+    if not text:
+        return False
+    if not any(text.startswith(s) for s in INSTRUCTION_STARTERS):
+        return False
+    runs = [r for r in para.runs if r.text.strip()]
+    if not runs:
+        return False
+    all_bold = all(r.bold is True for r in runs)
+    return not all_bold  # instruction = NOT all-bold
+
+
+def extract_runs_text(paragraph) -> str:
+    """
+    Extract text from a paragraph preserving bold (<b>) and underline (<u>).
+    Only marks formatting when explicitly True — not None/False.
+
+    Also handles the case where a single paragraph contains a \n followed by
+    a "Bitte..." run that is not bold — in that case the Bitte part is marked
+    [INSTRUCTION] so the LLM puts it in <span class=""instruction"">.
+    """
+    runs = paragraph.runs
+    parts = []
+    after_newline = False  # True if the previous meaningful run was a bare \n
+
+    for run in runs:
+        text = run.text
+        if not text:
+            continue
+
+        # Case 1: run is purely a newline separator
+        if text == "\n":
+            after_newline = True
+            parts.append("\n")
+            continue
+
+        # Case 2: run contains an embedded newline (e.g. "question\nBitte...")
+        if "\n" in text:
+            segments = text.split("\n")
+            for s_i, seg in enumerate(segments):
+                if s_i == 0:
+                    t = seg
+                    if run.bold is True and t:
+                        t = f"<b>{t}</b>"
+                    if run.underline is True and t:
+                        t = f"<u>{t}</u>"
+                    if t:
+                        parts.append(t)
+                else:
+                    stripped = seg.strip()
+                    if stripped and any(stripped.startswith(s) for s in INSTRUCTION_STARTERS) and run.bold is not True:
+                        parts.append(f"\n[INSTRUCTION] {stripped}")
+                    elif stripped:
+                        t = stripped
+                        if run.bold is True:
+                            t = f"<b>{t}</b>"
+                        if run.underline is True:
+                            t = f"<u>{t}</u>"
+                        parts.append(f"\n{t}")
+            after_newline = False
+            continue
+
+        # Case 3: normal text run — check if it follows a bare \n and is an instruction
+        stripped = text.strip()
+        if after_newline and stripped and any(stripped.startswith(s) for s in INSTRUCTION_STARTERS) and run.bold is not True:
+            # Replace the trailing \n in parts with [INSTRUCTION] marker
+            if parts and parts[-1] == "\n":
+                parts[-1] = ""  # remove the bare newline
+            parts.append(f"\n[INSTRUCTION] {stripped}")
+            after_newline = False
+            continue
+
+        after_newline = False
+        if run.bold is True:
+            text = f"<b>{text}</b>"
+        if run.underline is True:
+            text = f"<u>{text}</u>"
+        parts.append(text)
+
+    return "".join(parts)
+
+
+def extract_cell_content(cell) -> str:
+    """
+    Extract all paragraphs from a cell.
+    If the LAST paragraph looks like an instruction (starts with 'Bitte...'
+    and is not all-bold), mark it with [INSTRUCTION] prefix.
+    This lets the LLM know to put it in <span class=""instruction"">.
+    """
+    paras = [p for p in cell.paragraphs if p.text.strip()]
+    if not paras:
+        return ""
+    parts = []
+    for i, para in enumerate(paras):
+        is_last = (i == len(paras) - 1)
+        if is_last and len(paras) > 1 and is_instruction_paragraph(para):
+            parts.append(f"[INSTRUCTION] {para.text.strip()}")
+        else:
+            parts.append(extract_runs_text(para).strip())
+    return "\n".join(p for p in parts if p)
+
+
+def is_base_row(row) -> bool:
+    """Returns True if this table row is a Base/routing row (row 0 with Base: text)."""
+    for cell in row.cells:
+        if cell.text.strip().startswith("Base:"):
+            return True
+    return False
+
+
+def extract_base_text(row) -> str:
+    """Extract the Base: text from a routing row, deduplicated."""
+    seen = set()
+    parts = []
+    for cell in row.cells:
+        txt = cell.text.strip()
+        if txt and txt not in seen:
+            seen.add(txt)
+            parts.append(txt)
+    return " ".join(parts)
+
+
 def extract_text_from_docx(file) -> str:
     doc = docx.Document(file)
     content = []
 
-    # Paragraphs
+    # Paragraphs — preserve bold/underline formatting
     for para in doc.paragraphs:
-        text = para.text.strip()
+        text = extract_runs_text(para).strip()
         if text:
             content.append(text)
 
-    # Tables
+    # Tables — detect Base rows, instructions, preserve bold/underline
     table_lines = []
     for table in doc.tables:
-        for row in table.rows:
+        for r_i, row in enumerate(table.rows):
+            # Row 0 with Base: → emit as [BASE] comment for MDD routing
+            if r_i == 0 and is_base_row(row):
+                base_text = extract_base_text(row)
+                table_lines.append(f"[BASE] {base_text}")
+                continue
+
             row_data = []
-
             for cell in row.cells:
-                cell_text = " ".join(
-                    line.strip() for line in cell.text.splitlines() if line.strip()
-                ).strip()
-
+                cell_text = extract_cell_content(cell)
                 if cell_text:
                     row_data.append(cell_text)
 
+            # Deduplicate consecutive identical cells
             unique_data = []
             for item in row_data:
                 if item not in unique_data:
@@ -103,6 +241,7 @@ Do NOT explain.
 Output ONLY raw MDD code.
 
 CRITICAL SYNTAX RULES (DO NOT BREAK):
+
 1. IGNORE SECTION HEADERS:
    Ignore non-question headers and noise such as:
    - "LINEARES TV"
@@ -166,9 +305,25 @@ CRITICAL SYNTAX RULES (DO NOT BREAK):
    If color is specified, use:
    <span style='color:blue'><strong>{{{{#kids_name.response.value}}}}</strong></span>
 
-11. NO ROUTING LOGIC:
-   DO NOT output routing logic, filter conditions, masks, helper derivations, or VisibleIf.
-   Keep it strictly structural MDD only.
+11. BASE / ROUTING COMMENTS:
+   The source document marks routing information with [BASE] at the start of a line.
+   Example: "[BASE] Base: if Q2 item 2 ≠ code 6 (nie); [M]; [SC]"
+
+   RULE: Output EVERY [BASE] line as an MDD comment on the line IMMEDIATELY BEFORE
+   the question it belongs to, using single-quote syntax:
+   'Base: if Q2 item 2 ≠ code 6 (nie); [M]; [SC]
+
+   - Strip the [BASE] prefix, keep everything after it verbatim.
+   - Place the comment directly before the question definition (no blank line between them).
+   - DO NOT output routing logic (VisibleIf, filter conditions, masks) — only the comment.
+
+   CORRECT:
+   'Base: if Q2 item 2 (Mediatheken) ≠ code 6 (nie); [S per row]; [SC]
+   Q7 "<div class=""qtext"">...</div>"
+   ...
+
+   WRONG (comment missing):
+   Q7 "<div class=""qtext"">...</div>"
 
 12. BANKED GRIDS:
    ALL normal categorical grids/loops MUST include:
@@ -179,23 +334,73 @@ CRITICAL SYNTAX RULES (DO NOT BREAK):
    Do NOT use banked for simple repeated OE/title-entry grids.
 
 13. HTML FORMATTING FOR QUESTION TEXTS:
-   - NEVER automatically wrap the whole question text in <strong>...</strong>.
-   - Preserve bold EXACTLY where it is intended from the source text.
-   - Only the words that are actually emphasized in the source may be wrapped in <strong>.
-   - If no words are explicitly emphasized in the source, do NOT invent bold text.
-   - Keep all question text inside:
-     <div class=""qtext""> ... </div>
+   - The source text uses <b>...</b> to mark bold runs and <u>...</u> to mark underline runs.
+   - These tags appear ONLY where the Word document has explicit formatting.
+   - MANDATORY: Convert EVERY <b>text</b> from source → <strong>text</strong> in MDD output.
+   - MANDATORY: Convert EVERY <u>text</u> from source → <u>text</u> in MDD output.
+   - Do NOT skip, drop, or ignore any <b> or <u> tags from the source.
+   - Do NOT add bold or underline where it is NOT in the source.
+   - Do NOT wrap the entire question text in <strong> unless every run is marked <b>.
+   - Keep all question text inside: <div class=""qtext""> ... </div>
 
-14. HTML FORMATTING FOR INSTRUCTIONS:
-   - Any instruction text MUST be outside the qtext div.
-   - The instruction span MUST start on the NEXT ROW after </div>, never on the same row.
-   - Always format instruction text exactly like this:
+   BOLD CONVERSION EXAMPLES:
+   Source: "<b>Was ist die </b><u><b>maximale</b></u><b> Anzahl...</b>"
+   MDD:    "<div class=""qtext""><strong>Was ist die </strong><u><strong>maximale</strong></u><strong> Anzahl...</strong></div>"
 
-     QX "<div class=""qtext"">Question text here</div>
-     <span class=""instruction"">Instruction text here</span>"
+   Source: "Im Folgenden sehen Sie..."  (no <b> tags)
+   MDD:    "<div class=""qtext"">Im Folgenden sehen Sie...</div>"  (no bold added)
 
-   - NEVER output:
-     </div><span class=""instruction"">...</span>
+14. HTML FORMATTING FOR INSTRUCTIONS — ALL QUESTION TYPES:
+
+   HOW TO DETECT INSTRUCTIONS IN THE SOURCE:
+   The source document marks instructions with the tag [INSTRUCTION] at the start of a line.
+   Example source line: "[INSTRUCTION] Bitte wählen Sie bis zu drei Anbieter aus."
+   This means the preprocessor already identified that paragraph as an instruction.
+
+   RULE A — [INSTRUCTION] TAG PRESENT:
+   - If a line in the source starts with [INSTRUCTION], ALWAYS output it as:
+     <span class=""instruction"">...text without [INSTRUCTION] prefix...</span>
+   - This applies to ALL question types: single, multi, grid (banked), OE, numeric.
+   - The span MUST be on the NEXT LINE after </div>, never on the same line.
+   - No space between </div> and the newline.
+
+   RULE B — NO [INSTRUCTION] TAG:
+   - If no [INSTRUCTION] tag appears in the source for a question, output ONLY:
+     <div class=""qtext"">...</div>"
+   - DO NOT invent any instruction text.
+   - DO NOT add <span class=""instruction""> if [INSTRUCTION] is absent.
+
+   RULE C — INSTRUCTION INSIDE QUESTION TEXT:
+   - Sometimes an instruction sentence appears at the END of the question text paragraph
+     (e.g. "...am ehesten? Bitte wählen Sie bis zu drei Anbieter aus.").
+   - In that case: split the text. Put the question part in <div class=""qtext"">,
+     and move the "Bitte..." sentence to <span class=""instruction"">.
+   - A sentence is an instruction if it starts with "Bitte " and comes AFTER the main question.
+
+   FORMATTING — ALWAYS:
+   - </div> immediately followed by newline, then <span class=""instruction""> on the next line.
+   - NEVER: </div><span ...> (same line)
+   - NEVER: </div> <span ...> (space + same line)
+
+   CORRECT — with [INSTRUCTION] in source:
+     Q1 "<div class=""qtext"">Welche Geräte sind vorhanden?</div>
+<span class=""instruction"">Bitte geben Sie alles Zutreffende an.</span>"
+     categorical [0..] {{ _1 "Smartphone" }} ran;
+
+   CORRECT — no [INSTRUCTION] in source:
+     Q2 "<div class=""qtext"">Im Folgenden sehen Sie verschiedene Medien. Bitte geben Sie an, wie oft Sie diese privat nutzen.</div>"
+     [
+         GfKGridType = "banked"
+     ]
+     loop {{ ... }} ran fields - ( ... ) expand grid;
+
+   CORRECT — instruction embedded at end of question text (Rule C):
+     Q17 "<div class=""qtext"">Im Folgenden wollen wir von Ihnen wissen... Mit welchem der folgenden Anbieter verbinden Sie {{#Q17.Loop.Current.Label}} am ehesten?</div>
+<span class=""instruction"">Bitte wählen Sie bis zu drei Anbieter aus.</span>"
+     [
+         GfKGridType = "banked"
+     ]
+     loop {{ ... }} ran fields - ( ... ) expand grid;
 
 15. DO NOT CHANGE QUESTION / ANSWER MEANING:
    Do not paraphrase unless needed for correct syntax.
@@ -247,7 +452,10 @@ CRITICAL SYNTAX RULES (DO NOT BREAK):
 
 REFERENCE PATTERNS:
 
-'=====Multiple choice with instruction on next row
+'=====Multiple choice with Base comment + instruction
+'Source [BASE] line: "[BASE] Base: all respondents; randomize items except code 99, [M]; [SC];"
+'Source question line: "Welche der genannten Geräte...\n[INSTRUCTION] Bitte geben Sie alles Zutreffende an."
+'Base: all respondents; randomize items except code 99, [M]; [SC];
 Q1 "<div class=""qtext"">Welche der genannten Geräte sind in Ihrem Haushalt vorhanden?</div>
 <span class=""instruction"">Bitte geben Sie alles Zutreffende an.</span>"
 categorical [0..]
@@ -256,7 +464,9 @@ categorical [0..]
     _99 "keines der genannten" fix exclusive
 }} ran;
 
-'=====Grid with banked
+'=====Grid (banked) WITHOUT instruction - source has no [INSTRUCTION] tag
+'Source cell: "Im Folgenden sehen Sie verschiedene Medien. Bitte geben Sie an, wie oft Sie diese privat nutzen."
+'No [INSTRUCTION] tag → NO <span class=""instruction""> added
 Q2 "<div class=""qtext"">Im Folgenden sehen Sie verschiedene Medien. Bitte geben Sie an, wie oft Sie diese privat nutzen.</div>"
 [
     GfKGridType = "banked"
@@ -275,9 +485,61 @@ loop
     }};
 ) expand grid;
 
-'=====Example with partial bold only where intended
-Q15 "<div class=""qtext"">Auf welchen Produktkategorien hat <strong>Hofer</strong> aktuell zu wenige/unattraktive Aktionen / Angebote?</div>
-<span class=""instruction"">Bitte wählen Sie <strong>bis zu 5 Produktkategorien</strong> aus!</span>"
+'=====Grid (banked) WITH [INSTRUCTION] tag in source
+'Source cell: "Bitte bewerten Sie die folgenden Aussagen.\n[INSTRUCTION] Bitte vergeben Sie für jede Zeile eine Bewertung."
+Q3 "<div class=""qtext"">Bitte bewerten Sie die folgenden Aussagen.</div>
+<span class=""instruction"">Bitte vergeben Sie für jede Zeile eine Bewertung.</span>"
+[
+    GfKGridType = "banked"
+]
+loop
+{{
+    _1 "Aussage A",
+    _2 "Aussage B"
+}} ran fields -
+(
+    _scale ""
+    categorical [0..1]
+    {{
+        _1 "stimme voll zu",
+        _2 "stimme eher zu"
+    }};
+) expand grid;
+
+'=====Grid with instruction embedded at end of question text (Rule C)
+'Source: "Im Folgenden wollen wir... am ehesten?\n[INSTRUCTION] Bitte wählen Sie bis zu drei Anbieter aus."
+Q17 "<div class=""qtext"">Im Folgenden wollen wir von Ihnen wissen, wie sehr Sie die folgenden Sendungsarten / Genres mit bestimmten Streaminganbietern bzw. Mediatheken verbinden. Mit welchem der folgenden Anbieter verbinden Sie {{#Q17.Loop.Current.Label}} am ehesten?</div>
+<span class=""instruction"">Bitte wählen Sie bis zu drei Anbieter aus.</span>"
+[
+    GfKGridType = "banked"
+]
+loop
+{{
+    _1 "Serien",
+    _2 "Filme"
+}} ran fields -
+(
+    _scale ""
+    categorical [0..3]
+    {{
+        _1 "Netflix",
+        _2 "Amazon Prime Video"
+    }};
+) expand grid;
+
+'=====Example with partial bold and underline only where marked in source (<b> tags in source)
+'Source: "<b>Was ist die </b><u><b>maximale</b></u><b> Anzahl...</b>"
+Q13 "<div class=""qtext""><strong>Was ist die </strong><u><strong>maximale</strong></u><strong> Anzahl an Anbietern, bei denen Sie sich vorstellen könnten, ein kostenpflichtiges Abo abzuschließen?</strong></div>"
+categorical [0..1]
+{{
+    _1 "1",
+    _2 "2"
+}};
+
+'=====Example with NO bold in source - plain question text
+'Source: "Im Folgenden sehen Sie..." (no <b> tags)
+Q15 "<div class=""qtext"">Auf welchen Produktkategorien hat Hofer aktuell zu wenige/unattraktive Aktionen / Angebote?</div>
+<span class=""instruction"">Bitte wählen Sie bis zu 5 Produktkategorien aus!</span>"
 categorical [0..5]
 {{
     _1 "Kategorie 1",
@@ -305,6 +567,7 @@ Raw Survey Document to convert:
 
 {document_text}
 """.strip()
+
 
 # =========================
 # FILE UPLOAD
