@@ -6,10 +6,10 @@ import google.generativeai as genai
 st.set_page_config(page_title="Word to MDD Converter", page_icon="📝", layout="wide")
 
 st.title("📝 Word to MDD/Dimensions Script Converter")
-st.markdown("Încarcă un fișier Word cu chestionarul tău, iar inteligența artificială îl va transforma în cod MDD.")
+st.markdown("Încarcă un fișier Word cu chestionarul tău.")
 
 # 2. Input pentru API Key
-api_key = st.text_input("Introdu cheia ta API Gemini:", type="password")
+api_key = st.text_input("Introdu cheia", type="password")
 
 # 3. Funcția de citire Word
 def extract_text_from_docx(file):
